@@ -1,0 +1,132 @@
+/**
+ * Calculates the average premium for a fleet quote.
+ *
+ * @param {number} inputFleetSize  - Number of vehicles in the fleet.
+ * @param {boolean} [bustCache]    - Pass true to force a refresh of cached sheet data.
+ * @returns {number} Average premium across all approved/matched VINs.
+ */
+function premium_fleetsize(inputFleetSize, bustCache = false) {
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = spreadsheet.getActiveSheet();
+    const sheetFleetSize = spreadsheet.getSheetByName("Fleetsizecoefficients");
+    const sheetRiskGroup = spreadsheet.getSheetByName("FeeByRiskGroup");
+  
+    // ===== Cache setup =====
+    const props = PropertiesService.getScriptProperties();
+  
+    let dataFleetSizecoeff = bustCache ? null : JSON.parse(props.getProperty("fleetSizeCoeff") || "null");
+    let dataRiskGroup     = bustCache ? null : JSON.parse(props.getProperty("riskGroup")       || "null");
+  
+    if (!dataFleetSizecoeff) {
+      dataFleetSizecoeff = sheetFleetSize.getRange("A2:C" + sheetFleetSize.getLastRow()).getValues();
+      props.setProperty("fleetSizeCoeff", JSON.stringify(dataFleetSizecoeff));
+    }
+  
+    if (!dataRiskGroup) {
+      dataRiskGroup = sheetRiskGroup.getRange("A2:F" + sheetRiskGroup.getLastRow()).getValues();
+      props.setProperty("riskGroup", JSON.stringify(dataRiskGroup));
+    }
+  
+    // ===== Off Rent Endorsement check =====
+    const oreValue  = sheet.getRange("F3").getValue();
+    const oreApplied = oreValue !== "" && oreValue !== "N/a";
+  
+    // ===== Determine data row count from VIN column =====
+    const lastRow   = sheet.getLastRow();
+    const firstDataRow = 15;
+    if (lastRow < firstDataRow) {
+      Logger.log("No data rows found.");
+      return 0;
+    }
+    const maxRows = lastRow - firstDataRow + 1;
+  
+    // Batch-read all needed columns in one pass each
+    const vinData      = sheet.getRange(`A${firstDataRow}:A${lastRow}`).getValues();
+    const data2        = sheet.getRange(`J${firstDataRow}:L${lastRow}`).getValues(); // Year, ACV
+    const data3        = sheet.getRange(`N${firstDataRow}:N${lastRow}`).getValues(); // Territory
+    const data4        = sheet.getRange(`P${firstDataRow}:P${lastRow}`).getValues(); // Deductible
+    const dataApproval = sheet.getRange(`I${firstDataRow}:I${lastRow}`).getValues(); // Approval status
+  
+    // ===== Fleet Size Coefficient Lookup =====
+    let coeffFleetSize = 1;
+    for (const [min, max, coeff] of dataFleetSizecoeff) {
+      if (inputFleetSize >= Number(min) && inputFleetSize < Number(max)) {
+        coeffFleetSize = Number(coeff);
+        break;
+      }
+    }
+  
+    // ===== Risk Group Lookup Map =====
+    const riskLookup = {};
+    for (const row of dataRiskGroup) {
+      const deductible = String(row[0]);
+      if (!riskLookup[deductible]) riskLookup[deductible] = [];
+      riskLookup[deductible].push({
+        min:        Number(row[2]),
+        max:        Number(row[3]),
+        premium:    Number(row[4]),           // col E — standard
+        premiumORE: isNaN(Number(row[5]))     // col F — ORE, fallback to standard
+          ? Number(row[4])
+          : Number(row[5])
+      });
+    }
+  
+    // ===== Main Loop =====
+    const premiumValues = [];
+  
+    for (let i = 0; i < maxRows; i++) {
+      const vin = vinData[i][0];
+      if (!vin) continue;  // skip empty rows
+  
+      const y = Number(data2[i]?.[0] || 0);
+      const a = Number(data2[i]?.[1] || 0);
+      const t = Number(data3[i]?.[0] || 0);
+      const d = String(data4[i]?.[0] || "");
+      const isApproved = String(dataApproval[i]?.[0] || "") === "Approved";
+  
+      const coeff_finalrisk = y * a * t * coeffFleetSize;
+      const useORE = oreApplied && isApproved;
+  
+      const ranges = riskLookup[d] || [];
+      let matched = false;
+  
+      for (const r of ranges) {
+        if (coeff_finalrisk >= r.min && coeff_finalrisk < r.max) {
+          const premium = useORE ? r.premiumORE : r.premium;
+          premiumValues.push(premium);
+          matched = true;
+          Logger.log(
+            `VIN: ${vin} | Year: ${y} | ACV: ${a} | Terr: ${t} | ` +
+            `FleetCoeff: ${coeffFleetSize} | FinalRisk: ${coeff_finalrisk} | ` +
+            `Deductible: ${d} | ORE: ${useORE} | Premium: ${premium}`
+          );
+          break;
+        }
+      }
+  
+      if (!matched) {
+        Logger.log(
+          `WARNING — No range matched: VIN: ${vin} | Deductible: ${d} | FinalRisk: ${coeff_finalrisk}`
+        );
+        // Decide whether to push 0 or skip; currently skipping to avoid skewing average
+      }
+    }
+  
+    // ===== Average Premium =====
+    if (premiumValues.length === 0) {
+      Logger.log("No premiums calculated — check VIN data, deductibles, and risk ranges.");
+      return 0;
+    }
+  
+    const sum = premiumValues.reduce((acc, val) => acc + val, 0);
+    const averagePremium = sum / premiumValues.length;
+  
+    Logger.log(`Average Premium: ${averagePremium} | Divided by 100: ${averagePremium / 100}`);
+    return averagePremium;
+  }
+  
+  function testPremiumFleetSize() {
+    // Pass true as second arg to bust the cache during testing
+    const result = premium_fleetsize(15, true);
+    Logger.log("Returned Average Premium: " + result);
+  }
