@@ -5,22 +5,86 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Finance Emails</title>
   <style>
-    body { font-family: arial, helvetica, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #333; }
-    h1 { font-size: 22px; border-bottom: 1px solid #ddd; padding-bottom: 12px; }
-    ul { list-style: none; padding: 0; }
-    li { padding: 10px 0; border-bottom: 1px solid #f0f0f0; }
-    a { color: #1188E6; text-decoration: none; }
-    a:hover { text-decoration: underline; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: arial, helvetica, sans-serif; display: flex; height: 100vh; overflow: hidden; }
+
+    #sidebar {
+      width: 240px;
+      min-width: 240px;
+      background: #f7f7f7;
+      border-right: 1px solid #ddd;
+      display: flex;
+      flex-direction: column;
+      padding: 24px 0;
+    }
+    #sidebar h1 {
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #999;
+      padding: 0 20px 16px;
+      border-bottom: 1px solid #e5e5e5;
+      margin-bottom: 8px;
+    }
+    #sidebar ul { list-style: none; }
+    #sidebar li a {
+      display: block;
+      padding: 10px 20px;
+      font-size: 13px;
+      color: #333;
+      text-decoration: none;
+      line-height: 1.4;
+      cursor: pointer;
+    }
+    #sidebar li a:hover { background: #ececec; }
+    #sidebar li a.active { background: #e0eaf8; color: #1158b8; font-weight: 600; }
+
+    #preview {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #e8e8e8;
+    }
+    #preview iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+    #placeholder {
+      color: #aaa;
+      font-size: 14px;
+    }
   </style>
 </head>
 <body>
-  <h1>Finance Emails</h1>
-  <ul>
-    <li><a href="payment-reminder-10day.html">Payment Reminder (10 Day)</a></li>
-    <li><a href="payment-reminder-5day.html">Payment Reminder (5 Day)</a></li>
-    <li><a href="failed-payment-notice.html">Failed Payment Notice</a></li>
-    <li><a href="reinstatement-consideration-terms.html">Reinstatement – Consideration Terms</a></li>
-    <li><a href="no-reinstatement-final-notice.html">No Reinstatement – Final Notice of Deactivation</a></li>
-  </ul>
+  <div id="sidebar">
+    <h1>Finance Emails</h1>
+    <ul>
+      <li><a href="#" onclick="load('payment-reminder-10day.html', this)">Payment Reminder (10 Day)</a></li>
+      <li><a href="#" onclick="load('payment-reminder-5day.html', this)">Payment Reminder (5 Day)</a></li>
+      <li><a href="#" onclick="load('failed-payment-notice.html', this)">Failed Payment Notice</a></li>
+      <li><a href="#" onclick="load('reinstatement-consideration-terms.html', this)">Reinstatement – Consideration Terms</a></li>
+      <li><a href="#" onclick="load('no-reinstatement-final-notice.html', this)">No Reinstatement – Final Notice of Deactivation</a></li>
+    </ul>
+  </div>
+  <div id="preview">
+    <p id="placeholder">Select an email to preview</p>
+    <iframe id="frame" style="display:none"></iframe>
+  </div>
+
+  <script>
+    function load(src, el) {
+      event.preventDefault();
+      document.querySelectorAll('#sidebar a').forEach(a => a.classList.remove('active'));
+      el.classList.add('active');
+      const frame = document.getElementById('frame');
+      const placeholder = document.getElementById('placeholder');
+      frame.src = src;
+      frame.style.display = 'block';
+      placeholder.style.display = 'none';
+    }
+  </script>
 </body>
 </html>
