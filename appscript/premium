@@ -1,0 +1,409 @@
+/**
+ * Internal: runs the VIN loop once and returns a map of resolved deductible → [premium values].
+ * Used by both premium() and premium_averaged() to avoid redundant sheet reads.
+ *
+ * @param {number} inputFleetSize
+ * @param {string} inputORE - ORE value ("Applied" or "N/a")
+ * @param {boolean} bustCache
+ * @returns {Object} Map of deductible key → array of matched premium values
+ */
+function _computePremiums(inputFleetSize, inputORE, bustCache) {
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = spreadsheet.getSheetByName("Fleet Summary");
+    const sheetTerritory = spreadsheet.getSheetByName("StateTerritory");
+    const sheetYear      = spreadsheet.getSheetByName("ModelYearCoefficients");
+    const sheetEstValue  = spreadsheet.getSheetByName("Estimatedvaluecoefficients");
+    const sheetFleetSize = spreadsheet.getSheetByName("Fleetsizecoefficients");
+    const sheetRiskGroup = spreadsheet.getSheetByName("FeeByRiskGroup");
+
+    // ===== Cache setup =====
+    const props = PropertiesService.getScriptProperties();
+
+    let dataTerritory    = bustCache ? null : JSON.parse(props.getProperty("territory")     || "null");
+    let dataYear         = bustCache ? null : JSON.parse(props.getProperty("year")          || "null");
+    let dataEstValuecoeff  = bustCache ? null : JSON.parse(props.getProperty("estValueCoeff")  || "null");
+    let dataFleetSizecoeff = bustCache ? null : JSON.parse(props.getProperty("fleetSizeCoeff") || "null");
+    let dataRiskGroup    = bustCache ? null : JSON.parse(props.getProperty("riskGroup")     || "null");
+
+    if (!dataTerritory) {
+        dataTerritory = sheetTerritory.getRange("A2:C" + sheetTerritory.getLastRow()).getValues();
+        props.setProperty("territory", JSON.stringify(dataTerritory));
+    }
+    if (!dataYear) {
+        dataYear = sheetYear.getRange("A2:C" + sheetYear.getLastRow()).getValues();
+        props.setProperty("year", JSON.stringify(dataYear));
+    }
+    if (!dataEstValuecoeff) {
+        dataEstValuecoeff = sheetEstValue.getRange("A2:D" + sheetEstValue.getLastRow()).getValues();
+        props.setProperty("estValueCoeff", JSON.stringify(dataEstValuecoeff));
+    }
+    if (!dataFleetSizecoeff) {
+        dataFleetSizecoeff = sheetFleetSize.getRange("A2:D" + sheetFleetSize.getLastRow()).getValues();
+        props.setProperty("fleetSizeCoeff", JSON.stringify(dataFleetSizecoeff));
+    }
+    if (!dataRiskGroup) {
+        dataRiskGroup = sheetRiskGroup.getRange("A2:F" + sheetRiskGroup.getLastRow()).getValues();
+        props.setProperty("riskGroup", JSON.stringify(dataRiskGroup));
+    }
+
+    // ===== Determine data row count =====
+    const lastRow     = sheet.getLastRow();
+    const firstDataRow = 7;
+    if (lastRow < firstDataRow) {
+        Logger.log("No data rows found.");
+        return {};
+    }
+    const maxRows = lastRow - firstDataRow + 1;
+
+    // ===== Batch-read all needed columns =====
+    const vinData        = sheet.getRange(`A${firstDataRow}:A${lastRow}`).getValues();
+    const yearData       = sheet.getRange(`B${firstDataRow}:B${lastRow}`).getValues();
+    const acvData        = sheet.getRange(`E${firstDataRow}:E${lastRow}`).getValues();
+    const stateData      = sheet.getRange(`F${firstDataRow}:F${lastRow}`).getValues();
+    const deductibleData = sheet.getRange(`G${firstDataRow}:G${lastRow}`).getValues();
+
+    const oreApplied = inputORE === "Applied";
+
+    // ===== Constants =====
+    const VERSION_1_T = 0.9515547694725730;
+
+    // ===== Deductible Resolution =====
+    // Maps dropdown values to risk table keys, and resolves OSP by ACV (capped at 75K)
+    const deductibleMap = {
+        "1k":      "1000",
+        "2.5k":    "2500",
+        "5k":      "5000",
+        "50% HDP": "50% ACV",
+        "75% HDP": "75% ACV"
+    };
+
+    function resolveDeductible(rawDeductible, acv) {
+        if (rawDeductible === "OSP") {
+            const effectiveACV = Math.min(acv, 75000);
+            return effectiveACV < 45000 ? "1000" : "2500";
+        }
+        return deductibleMap[rawDeductible] || rawDeductible;
+    }
+
+    // ===== Coefficient Lookup Helpers =====
+    function lookupTerritoryCoeff(state) {
+        for (const [st, , coeff] of dataTerritory) {  // col A = state, col B = territory name (skipped), col C = coefficient
+            if (String(st) === state) return Number(coeff);
+        }
+        Logger.log(`Territory NOT FOUND for state: "${state}"`);
+        return 1;
+    }
+
+    function lookupYearCoeff(year) {
+        for (const [min, max, coeff] of dataYear) {
+            if (year >= Number(min) && year < Number(max)) return Number(coeff);
+        }
+        return 1;
+    }
+
+    function lookupEstValueCoeff(version, acv) {
+        for (const [ver, min, max, coeff] of dataEstValuecoeff) {
+            if (Number(ver) === version && acv >= Number(min) && acv < Number(max)) return Number(coeff);
+        }
+        return 1;
+    }
+
+    function lookupFleetSizeCoeff(version) {
+        for (const [ver, min, max, coeff] of dataFleetSizecoeff) {
+            if (Number(ver) === version && inputFleetSize >= Number(min) && inputFleetSize < Number(max)) return Number(coeff);
+        }
+        return 1;
+    }
+
+    // Fleet size is constant — pre-compute both versions
+    const coeffFleetSizeV1 = lookupFleetSizeCoeff(1);
+    const coeffFleetSizeV2 = lookupFleetSizeCoeff(2);
+
+    // ===== Risk Group Lookup Map =====
+    const riskLookup = {};
+    for (const row of dataRiskGroup) {
+        const deductible = String(row[0]);
+        if (!riskLookup[deductible]) riskLookup[deductible] = [];
+        riskLookup[deductible].push({
+            min:        Number(row[2]),
+            max:        Number(row[3]),
+            premium:    Number(row[4]),
+            premiumORE: isNaN(Number(row[5])) ? Number(row[4]) : Number(row[5])
+        });
+    }
+
+    // ===== Main Loop — single pass, collect premiums by deductible =====
+    const resultMap = {};  // { resolvedDeductible: [premiumValues] }
+
+    for (let i = 0; i < maxRows; i++) {
+        const vin = vinData[i][0];
+        if (!vin) continue;
+
+        const vinState = String(stateData[i][0]);
+
+        const t        = lookupTerritoryCoeff(vinState);
+        const version  = (vinState === "FL" || t === VERSION_1_T) ? 1 : 2;
+
+        const y              = lookupYearCoeff(Number(yearData[i][0]));
+        const acv            = Number(acvData[i][0]);
+        const d              = resolveDeductible(String(deductibleData[i][0]), acv);
+        const coeffEstValue  = lookupEstValueCoeff(version, acv);
+        const coeffFleetSize = (version === 1) ? coeffFleetSizeV1 : coeffFleetSizeV2;
+
+        const coeff_finalrisk = y * coeffEstValue * t * coeffFleetSize;
+        if (isNaN(coeff_finalrisk)) {
+            Logger.log(`NaN DEBUG — VIN: ${vin} | y: ${y} | EstValue: ${coeffEstValue} | t: ${t} | FleetSize: ${coeffFleetSize} | ACV: ${acv} | Year: ${yearData[i][0]} | Version: ${version}`);
+            continue;
+        }
+
+        const useORE = vinState !== "FL" && oreApplied;
+        const ranges = riskLookup[d] || [];
+        let matched = false;
+
+        for (const r of ranges) {
+            if (coeff_finalrisk >= r.min && coeff_finalrisk < r.max) {
+                const vehiclePremium = useORE ? r.premiumORE : r.premium;
+                if (!resultMap[d]) resultMap[d] = [];
+                resultMap[d].push(vehiclePremium);
+                matched = true;
+                Logger.log(
+                    `VIN: ${vin} | State: ${vinState} | Version: ${version} | Year: ${y} | ` +
+                    `ACV: ${acv} | Terr: ${t} | FleetCoeff: ${coeffFleetSize} | ` +
+                    `FinalRisk: ${coeff_finalrisk} | Deductible: ${d} | ORE: ${useORE} | Premium: ${vehiclePremium}`
+                );
+                break;
+            }
+        }
+
+        if (!matched) {
+            Logger.log(`WARNING — No range matched: VIN: ${vin} | State: ${vinState} | Deductible: ${d} | FinalRisk: ${coeff_finalrisk}`);
+        }
+    }
+
+    return resultMap;
+}
+
+/**
+ * Calculates the premium for a single vehicle row.
+ * Use as a per-row formula: =premium_row(B7, E7, F7, G7, H7, fleetSize)
+ *
+ * @param {number} inputYear - Model year (col B)
+ * @param {number} inputACV - Actual cash value (col E)
+ * @param {string} inputState - Lot state (col F)
+ * @param {string} inputDeductible - Deductible selection (col G, e.g. "OSP", "1k", "2.5k")
+ * @param {string} inputORE - Off rent exclusion (col H, "Applied" or "N/a")
+ * @param {number} inputFleetSize - Number of vehicles in the fleet
+ * @param {boolean} [bustCache] - Pass true to force a refresh of cached sheet data.
+ * @returns {number} Premium for this vehicle, or 0 if no range matched.
+ */
+function premium_row(inputYear, inputACV, inputState, inputDeductible, inputORE, inputFleetSize, bustCache = false) {
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const sheetTerritory = spreadsheet.getSheetByName("StateTerritory");
+    const sheetYear      = spreadsheet.getSheetByName("ModelYearCoefficients");
+    const sheetEstValue  = spreadsheet.getSheetByName("Estimatedvaluecoefficients");
+    const sheetFleetSize = spreadsheet.getSheetByName("Fleetsizecoefficients");
+    const sheetRiskGroup = spreadsheet.getSheetByName("FeeByRiskGroup");
+
+    // ===== Cache setup =====
+    const props = PropertiesService.getScriptProperties();
+
+    let dataTerritory    = bustCache ? null : JSON.parse(props.getProperty("territory")     || "null");
+    let dataYear         = bustCache ? null : JSON.parse(props.getProperty("year")          || "null");
+    let dataEstValuecoeff  = bustCache ? null : JSON.parse(props.getProperty("estValueCoeff")  || "null");
+    let dataFleetSizecoeff = bustCache ? null : JSON.parse(props.getProperty("fleetSizeCoeff") || "null");
+    let dataRiskGroup    = bustCache ? null : JSON.parse(props.getProperty("riskGroup")     || "null");
+
+    if (!dataTerritory) {
+        dataTerritory = sheetTerritory.getRange("A2:C" + sheetTerritory.getLastRow()).getValues();
+        props.setProperty("territory", JSON.stringify(dataTerritory));
+    }
+    if (!dataYear) {
+        dataYear = sheetYear.getRange("A2:C" + sheetYear.getLastRow()).getValues();
+        props.setProperty("year", JSON.stringify(dataYear));
+    }
+    if (!dataEstValuecoeff) {
+        dataEstValuecoeff = sheetEstValue.getRange("A2:D" + sheetEstValue.getLastRow()).getValues();
+        props.setProperty("estValueCoeff", JSON.stringify(dataEstValuecoeff));
+    }
+    if (!dataFleetSizecoeff) {
+        dataFleetSizecoeff = sheetFleetSize.getRange("A2:D" + sheetFleetSize.getLastRow()).getValues();
+        props.setProperty("fleetSizeCoeff", JSON.stringify(dataFleetSizecoeff));
+    }
+    if (!dataRiskGroup) {
+        dataRiskGroup = sheetRiskGroup.getRange("A2:F" + sheetRiskGroup.getLastRow()).getValues();
+        props.setProperty("riskGroup", JSON.stringify(dataRiskGroup));
+    }
+
+    // ===== Constants =====
+    const VERSION_1_T = 0.9515547694725730;
+
+    const deductibleMap = {
+        "1k":      "1000",
+        "2.5k":    "2500",
+        "5k":      "5000",
+        "50% HDP": "50% ACV",
+        "75% HDP": "75% ACV"
+    };
+
+    // ===== Territory lookup =====
+    let t = 1;
+    for (const [st, , coeff] of dataTerritory) {
+        if (String(st) === inputState) { t = Number(coeff); break; }
+    }
+
+    const version = (inputState === "FL" || t === VERSION_1_T) ? 1 : 2;
+
+    // ===== Year coefficient =====
+    let y = 1;
+    for (const [min, max, coeff] of dataYear) {
+        if (inputYear >= Number(min) && inputYear < Number(max)) { y = Number(coeff); break; }
+    }
+
+    // ===== EstValue coefficient =====
+    let coeffEstValue = 1;
+    for (const [ver, min, max, coeff] of dataEstValuecoeff) {
+        if (Number(ver) === version && inputACV >= Number(min) && inputACV < Number(max)) { coeffEstValue = Number(coeff); break; }
+    }
+
+    // ===== FleetSize coefficient =====
+    let coeffFleetSize = 1;
+    for (const [ver, min, max, coeff] of dataFleetSizecoeff) {
+        if (Number(ver) === version && inputFleetSize >= Number(min) && inputFleetSize < Number(max)) { coeffFleetSize = Number(coeff); break; }
+    }
+
+    const coeff_finalrisk = y * coeffEstValue * t * coeffFleetSize;
+
+    // ===== Resolve deductible =====
+    let d;
+    if (inputDeductible === "OSP") {
+        const effectiveACV = Math.min(inputACV, 75000);
+        d = effectiveACV < 45000 ? "1000" : "2500";
+    } else {
+        d = deductibleMap[inputDeductible] || inputDeductible;
+    }
+
+    // ===== ORE =====
+    const useORE = inputState !== "FL" && inputORE === "Applied";
+
+    // ===== Risk group lookup =====
+    for (const row of dataRiskGroup) {
+        if (String(row[0]) !== d) continue;
+        const min = Number(row[2]);
+        const max = Number(row[3]);
+        if (coeff_finalrisk >= min && coeff_finalrisk < max) {
+            return useORE && !isNaN(Number(row[5])) ? Number(row[5]) : Number(row[4]);
+        }
+    }
+
+    Logger.log(`premium_row — No range matched: State: ${inputState} | ACV: ${inputACV} | Deductible: ${d} | FinalRisk: ${coeff_finalrisk}`);
+    return 0;
+}
+
+// ===== Helper: average an array of numbers =====
+function _average(values) {
+    if (values.length === 0) return 0;
+    return values.reduce((acc, val) => acc + val, 0) / values.length;
+}
+
+// ===== Helper: flatten values from selected keys of a resultMap =====
+function _collectValues(resultMap, keys) {
+    /** @type {number[]} */
+    const out = /** @type {number[]} */ ([]);
+    for (const key of keys) {
+        if (resultMap[key]) out.push(...resultMap[key]);
+    }
+    return out;
+}
+
+/**
+ * Calculates the average premium for a fleet quote using a specific deductible.
+ *
+ * @param {number} inputFleetSize - Number of vehicles in the fleet.
+ * @param {string} inputDeductible - Deductible value (e.g. "OSP", "1k", "2.5k", "5k", "50% HDP", "75% HDP")
+ * @param {string} inputState - Two letter abbrev. Lot State
+ * @param {string} inputORE - ORE value ("Applied" or "N/a")
+ * @param {boolean} [bustCache] - Pass true to force a refresh of cached sheet data.
+ * @returns {number} Average premium across all matched VINs.
+ */
+function premium(inputFleetSize, inputDeductible, inputState, inputORE, bustCache = false) {
+    // ===== Top Level Rules =====
+    if (inputState === "FL" && inputDeductible === "5k") {
+        Logger.log("Invalid: FL does not allow a 5K deductible.");
+        return 0;
+    }
+
+    const resultMap = _computePremiums(inputFleetSize, inputORE, bustCache);
+
+    // OSP resolves to 1000 or 2500 per VIN — collect both if input was OSP
+    // Otherwise map dropdown value to risk table key
+    const deductibleKeyMap = { "1k": "1000", "2.5k": "2500", "5k": "5000", "50% HDP": "50% ACV", "75% HDP": "75% ACV" };
+    const keys = inputDeductible === "OSP" ? ["1000", "2500"] : [deductibleKeyMap[inputDeductible] || inputDeductible];
+    const values = _collectValues(resultMap, keys);
+
+    if (values.length === 0) {
+        Logger.log("No premiums calculated — check VIN data, deductibles, and risk ranges.");
+        return 0;
+    }
+
+    const avg = _average(values);
+    Logger.log(`Average Premium (${inputDeductible}): ${avg}`);
+    return avg;
+}
+
+/**
+ * Averages the premium for a fleet quote by deductible type.
+ * "Flat" averages across OSP (1000/2500), 1000, 2500, and 5000 deductibles.
+ * "Percent" averages across 50% ACV and 75% ACV deductibles.
+ *
+ * @param {number} inputFleetSize - Number of vehicles in the fleet.
+ * @param {string} inputDeductibleType - "Flat" or "Percent"
+ * @param {string} inputORE - ORE value ("Applied" or "N/a")
+ * @param {boolean} [bustCache] - Pass true to force a refresh of cached sheet data.
+ * @returns {number} Average premium across all matched VINs for the given deductible type.
+ */
+function premium_averaged(inputFleetSize, inputDeductibleType, inputORE, bustCache = false) {
+    const flatKeys    = ["1000", "2500", "5000"];
+    const percentKeys = ["50% ACV", "75% ACV"];
+    const keys = inputDeductibleType === "Flat" ? flatKeys : percentKeys;
+
+    const resultMap = _computePremiums(inputFleetSize, inputORE, bustCache);
+    const values = _collectValues(resultMap, keys);
+
+    if (values.length === 0) {
+        Logger.log("premium_averaged: No premiums calculated for type: " + inputDeductibleType);
+        return 0;
+    }
+
+    const avg = _average(values);
+    Logger.log(`premium_averaged (${inputDeductibleType}): ${avg}`);
+    return avg;
+}
+
+function testPremium() {
+    const result = premium(
+        15,      // inputFleetSize
+        "OSP",   // inputDeductible
+        "FL",    // inputState
+        "N/a",   // inputORE
+        true     // bustCache — force fresh data
+    );
+    Logger.log("Returned Average Premium: " + result);
+}
+
+function testPremiumAveraged() {
+    const flatResult = premium_averaged(
+        15,      // inputFleetSize
+        "Flat",  // inputDeductibleType
+        "N/a",   // inputORE
+        true     // bustCache — force fresh data
+    );
+    Logger.log("Flat Average Premium: " + flatResult);
+
+    const percentResult = premium_averaged(
+        15,        // inputFleetSize
+        "Percent", // inputDeductibleType
+        "N/a",     // inputORE
+        true       // bustCache — force fresh data
+    );
+    Logger.log("Percent Average Premium: " + percentResult);
+}
