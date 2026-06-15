@@ -206,8 +206,9 @@ def find_candidates(accounts, name_threshold, require_address):
         elif not require_address and nname:
             blocks[("name", nname.split()[0])].append(idx)
 
+    # --- find all matching edges ---
     seen_pairs = set()
-    candidates = []
+    edges = []  # (score, idx_a, idx_b)
 
     for block_key, idxs in blocks.items():
         if len(idxs) < 2:
@@ -224,26 +225,57 @@ def find_candidates(accounts, name_threshold, require_address):
                     continue
                 score = fuzz.token_sort_ratio(na, nb)
                 if score >= name_threshold:
-                    ra, rb = accounts[a], accounts[b]
-                    candidates.append({
-                        "score": round(score, 1),
-                        "matched_on": block_key[0],
-                        "block": block_key[1],
-                        "id_a": ra["Id"], "name_a": ra.get("Name"),
-                        "street_a": ra.get("BillingStreet"),
-                        "city_a": ra.get("BillingCity"),
-                        "state_a": ra.get("BillingState"),
-                        "zip_a": ra.get("BillingPostalCode"),
-                        "created_a": ra.get("CreatedDate"),
-                        "id_b": rb["Id"], "name_b": rb.get("Name"),
-                        "street_b": rb.get("BillingStreet"),
-                        "city_b": rb.get("BillingCity"),
-                        "state_b": rb.get("BillingState"),
-                        "zip_b": rb.get("BillingPostalCode"),
-                        "created_b": rb.get("CreatedDate"),
-                    })
+                    edges.append((round(score, 1), a, b))
 
-    candidates.sort(key=lambda c: c["score"], reverse=True)
+    # --- union-find to cluster connected accounts ---
+    parent = list(range(len(accounts)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        parent[find(x)] = find(y)
+
+    for _, a, b in edges:
+        union(a, b)
+
+    # group indices by cluster root; only keep clusters with 2+ members
+    from collections import defaultdict as _dd
+    clusters = _dd(list)
+    matched_idxs = set(idx for _, a, b in edges for idx in (a, b))
+    for idx in matched_idxs:
+        clusters[find(idx)].append(idx)
+
+    # for each cluster, compute min/max score across its internal edges
+    cluster_scores = _dd(list)
+    for score, a, b in edges:
+        cluster_scores[find(a)].append(score)
+
+    candidates = []
+    for root, idxs in clusters.items():
+        idxs_sorted = sorted(idxs)
+        scores = cluster_scores[root]
+        row = {
+            "min_score": min(scores),
+            "max_score": max(scores),
+            "group_size": len(idxs_sorted),
+        }
+        for letter_idx, idx in enumerate(idxs_sorted):
+            suffix = chr(ord("a") + letter_idx)  # a, b, c, d, ...
+            rec = accounts[idx]
+            row[f"id_{suffix}"]      = rec["Id"]
+            row[f"name_{suffix}"]    = rec.get("Name")
+            row[f"street_{suffix}"]  = rec.get("BillingStreet")
+            row[f"city_{suffix}"]    = rec.get("BillingCity")
+            row[f"state_{suffix}"]   = rec.get("BillingState")
+            row[f"zip_{suffix}"]     = rec.get("BillingPostalCode")
+            row[f"created_{suffix}"] = rec.get("CreatedDate")
+        candidates.append(row)
+
+    candidates.sort(key=lambda c: c["max_score"], reverse=True)
     return candidates
 
 
@@ -291,16 +323,24 @@ def main():
 
     print("Matching...", file=sys.stderr)
     candidates = find_candidates(accounts, args.name_threshold, args.require_address)
-    print(f"Candidate duplicate pairs: {len(candidates)}", file=sys.stderr)
+    print(f"Candidate duplicate groups: {len(candidates)}", file=sys.stderr)
 
-    cols = ["score", "matched_on", "block",
-            "id_a", "name_a", "street_a", "city_a", "state_a", "zip_a", "created_a",
-            "id_b", "name_b", "street_b", "city_b", "state_b", "zip_b", "created_b"]
+    # Build column list dynamically from the widest group found
+    max_size = max((c["group_size"] for c in candidates), default=0)
+    per_account_fields = ["id", "name", "street", "city", "state", "zip", "created"]
+    fixed_cols = ["min_score", "max_score", "group_size"]
+    account_cols = [
+        f"{field}_{chr(ord('a') + i)}"
+        for i in range(max_size)
+        for field in per_account_fields
+    ]
+    cols = fixed_cols + account_cols
+
     with open(args.out, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(candidates)
-    print(f"Wrote {len(candidates)} pairs to {args.out}", file=sys.stderr)
+    print(f"Wrote {len(candidates)} groups to {args.out}", file=sys.stderr)
 
 
 if __name__ == "__main__":
