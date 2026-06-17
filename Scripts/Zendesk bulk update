@@ -1,0 +1,186 @@
+"""
+Zendesk Bulk Update Script: Change Brand and Assign Group for All Tickets
+
+This script:
+1. Finds all tickets with a specific old brand (including solved/closed tickets)
+2. Bulk updates them to a new brand
+3. Assigns them to a new group
+
+Usage:
+    python zendesk_bulk_update_brand_group.py
+
+Prerequisites:
+    pip install requests
+
+Configure the settings at the top of the script before running.
+"""
+
+import requests
+import time
+from requests.auth import HTTPBasicAuth
+
+# ==================== CONFIGURATION ====================
+# Replace these with your actual values
+
+# Your Zendesk subdomain (e.g., if your Zendesk URL is https://yourcompany.zendesk.com)
+ZENDESK_SUBDOMAIN = "your-subdomain"
+
+# Your Zendesk API credentials
+ZENDESK_EMAIL = "your-email@company.com"
+ZENDESK_API_TOKEN = "your-api-token-here"  # Create this in Admin Center > Channels > API
+
+# Brand IDs (get these from Admin Center > Account > Brand management > Brands)
+OLD_BRAND_ID = 12345678  # Current brand you want to replace
+NEW_BRAND_ID = 87654321  # New brand you want to move tickets to
+
+# Group ID (get this from Admin Center > People > Teams)
+NEW_GROUP_ID = 11223344  # Group you want to assign tickets to
+
+# Optional: Only process tickets updated after a certain date (ISO format, UTC)
+# Set to None to process all tickets
+UPDATED_AFTER = None  # Example: "2024-01-01T00:00:00Z"
+# =======================================================
+
+def get_auth():
+    """Create authentication object for Zendesk API"""
+    return HTTPBasicAuth(f"{ZENDESK_EMAIL}/token", ZENDESK_API_TOKEN)
+
+def get_all_ticket_ids_with_brand():
+    """
+    Fetch all ticket IDs that have the old brand.
+    Uses Zendesk's search API to find tickets, including solved/closed ones.
+    """
+    ticket_ids = []
+    page = 1
+    per_page = 100
+    
+    # Build search query - includes solved and closed tickets
+    query = f"brand:{OLD_BRAND_ID}"
+    if UPDATED_AFTER:
+        query += f" updated>{UPDATED_AFTER}"
+    
+    print(f"Searching for tickets with brand ID {OLD_BRAND_ID}...")
+    
+    while True:
+        url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json"
+        params = {
+            "query": query,
+            "type": "ticket",
+            "per_page": per_page,
+            "page": page
+        }
+        
+        response = requests.get(url, auth=get_auth(), params=params)
+        
+        if response.status_code != 200:
+            print(f"Error fetching tickets: {response.status_code} - {response.text}")
+            break
+        
+        data = response.json()
+        tickets = data.get("results", [])
+        
+        if not tickets:
+            break
+        
+        for ticket in tickets:
+            ticket_ids.append(ticket["id"])
+        
+        print(f"Page {page}: Found {len(tickets)} tickets (Total: {len(ticket_ids)})")
+        
+        # Check if there are more pages
+        if len(tickets) < per_page:
+            break
+        
+        page += 1
+        
+        # Be nice to the API - add a small delay
+        time.sleep(0.5)
+    
+    return ticket_ids
+
+def bulk_update_tickets(ticket_ids, new_brand_id, new_group_id):
+    """
+    Update multiple tickets at once using the 'update many' endpoint.
+    Zendesk allows up to 100 tickets per request [web:33][web:39].
+    """
+    updated_count = 0
+    failed_count = 0
+    
+    # Process in batches of 100 (API limit)
+    batch_size = 100
+    
+    print(f"\nUpdating {len(ticket_ids)} tickets in batches of {batch_size}...")
+    
+    for i in range(0, len(ticket_ids), batch_size):
+        batch = ticket_ids[i:i + batch_size]
+        batch_num = (i // batch_size) + 1
+        total_batches = (len(ticket_ids) + batch_size - 1) // batch_size
+        
+        print(f"\nBatch {batch_num}/{total_batches}: Updating tickets {batch[0]}-{batch[-1]}")
+        
+        url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/update_many.json"
+        payload = {
+            "ids": batch,
+            "ticket": {
+                "brand_id": new_brand_id,
+                "group_id": new_group_id
+            }
+        }
+        
+        response = requests.put(url, auth=get_auth(), json=payload)
+        
+        if response.status_code in [200, 201]:
+            updated_count += len(batch)
+            print(f"✓ Successfully updated {len(batch)} tickets")
+        else:
+            failed_count += len(batch)
+            print(f"✗ Failed to update batch: {response.status_code} - {response.text}")
+        
+        # Rate limiting - be nice to the API
+        time.sleep(0.5)
+    
+    return updated_count, failed_count
+
+def main():
+    """Main function to run the bulk update process"""
+    print("=" * 60)
+    print("Zendesk Bulk Update: Brand + Group Assignment")
+    print("=" * 60)
+    
+    # Step 1: Get all ticket IDs with the old brand
+    ticket_ids = get_all_ticket_ids_with_brand()
+    
+    if not ticket_ids:
+        print("\nNo tickets found with the specified brand ID.")
+        print("Check your OLD_BRAND_ID configuration.")
+        return
+    
+    print(f"\n{'=' * 60}")
+    print(f"Found {len(ticket_ids)} tickets to update")
+    print(f"Old Brand ID: {OLD_BRAND_ID}")
+    print(f"New Brand ID: {NEW_BRAND_ID}")
+    print(f"New Group ID: {NEW_GROUP_ID}")
+    print(f"{'=' * 60}\n")
+    
+    # Confirm before proceeding
+    confirm = input("Proceed with bulk update? (yes/no): ").strip().lower()
+    if confirm != "yes":
+        print("Aborted.")
+        return
+    
+    # Step 2: Bulk update all tickets
+    updated_count, failed_count = bulk_update_tickets(
+        ticket_ids, NEW_BRAND_ID, NEW_GROUP_ID
+    )
+    
+    # Step 3: Print summary
+    print("\n" + "=" * 60)
+    print("BULK UPDATE COMPLETE")
+    print("=" * 60)
+    print(f"Total tickets processed: {len(ticket_ids)}")
+    print(f"Successfully updated: {updated_count}")
+    print(f"Failed: {failed_count}")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    main()

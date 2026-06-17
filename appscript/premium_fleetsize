@@ -5,28 +5,24 @@
  * @param {boolean} [bustCache]    - Pass true to force a refresh of cached sheet data.
  * @returns {number} Average premium across all approved/matched VINs.
  */
-function premium_fleetsize(inputFleetSize, bustCache = false) {
+
+  // trigger absorbs any extra args passed from the sheet to force recalc
+  // no other changes needed
+  function premium_fleetsize(inputFleetSize, bustCache = false, ...trigger) { 
     const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = spreadsheet.getActiveSheet();
     const sheetFleetSize = spreadsheet.getSheetByName("Fleetsizecoefficients");
-    const sheetEstValue  = spreadsheet.getSheetByName("Estimatedvaluecoefficients");
     const sheetRiskGroup = spreadsheet.getSheetByName("FeeByRiskGroup");
   
     // ===== Cache setup =====
     const props = PropertiesService.getScriptProperties();
   
     let dataFleetSizecoeff = bustCache ? null : JSON.parse(props.getProperty("fleetSizeCoeff") || "null");
-    let dataEstValuecoeff  = bustCache ? null : JSON.parse(props.getProperty("estValueCoeff")  || "null");
-    let dataRiskGroup     = bustCache ? null : JSON.parse(props.getProperty("riskGroup")       || "null");
-
+    let dataRiskGroup      = bustCache ? null : JSON.parse(props.getProperty("riskGroup")       || "null");
+  
     if (!dataFleetSizecoeff) {
       dataFleetSizecoeff = sheetFleetSize.getRange("A2:D" + sheetFleetSize.getLastRow()).getValues();
       props.setProperty("fleetSizeCoeff", JSON.stringify(dataFleetSizecoeff));
-    }
-
-    if (!dataEstValuecoeff) {
-      dataEstValuecoeff = sheetEstValue.getRange("A2:D" + sheetEstValue.getLastRow()).getValues();
-      props.setProperty("estValueCoeff", JSON.stringify(dataEstValuecoeff));
     }
   
     if (!dataRiskGroup) {
@@ -34,52 +30,50 @@ function premium_fleetsize(inputFleetSize, bustCache = false) {
       props.setProperty("riskGroup", JSON.stringify(dataRiskGroup));
     }
   
-    // ===== Off Rent Endorsement check =====
-    const oreValue  = sheet.getRange("F3").getValue();
-    const oreApplied = oreValue !== "" && oreValue !== "N/a";
+    // ===== Rating version from state cell F2 =====
+    const state = String(sheet.getRange("F2").getValue()).trim().toUpperCase();
+    const ratingVersion = (state === "FL") ? 1 : 2;
+    Logger.log(`State: ${state} | Rating Version: ${ratingVersion}`);
   
-    // ===== Determine data row count from VIN column =====
-    const lastRow   = sheet.getLastRow();
-    const firstDataRow = 15;
+    // ===== Off Rent Endorsement check =====
+    const oreValue   = sheet.getRange("F3").getValue();
+    const oreApplied = oreValue !== "" && oreValue !== "N/a";
+    Logger.log(`ORE Value: "${oreValue}" | ORE Applied: ${oreApplied}`);
+  
+    // ===== Determine data row count =====
+    const lastRow      = sheet.getLastRow();
+    const firstDataRow = 16;
     if (lastRow < firstDataRow) {
       Logger.log("No data rows found.");
       return 0;
     }
     const maxRows = lastRow - firstDataRow + 1;
   
-    // Batch-read all needed columns in one pass each
+    // ===== Batch-read all needed columns =====
     const vinData      = sheet.getRange(`A${firstDataRow}:A${lastRow}`).getValues();
-    const data2        = sheet.getRange(`K${firstDataRow}:M${lastRow}`).getValues(); // Year, ACV
-    const data3        = sheet.getRange(`O${firstDataRow}:O${lastRow}`).getValues(); // Territory
-    const data4        = sheet.getRange(`Q${firstDataRow}:Q${lastRow}`).getValues(); // Deductible
-    const dataApproval = sheet.getRange(`J${firstDataRow}:J${lastRow}`).getValues(); // Approval status
+    const dataL        = sheet.getRange(`L${firstDataRow}:L${lastRow}`).getValues(); // Existing Fleet Size Coeff
+    const dataO        = sheet.getRange(`O${firstDataRow}:O${lastRow}`).getValues(); // Final Vehicle Risk
+    const dataP        = sheet.getRange(`P${firstDataRow}:P${lastRow}`).getValues(); // Deductible
+    const dataApproval = sheet.getRange(`G${firstDataRow}:G${lastRow}`).getValues(); // Approval status
   
-    // ===== Version-aware coefficient helpers =====
-    const VERSION_1_T = 0.9515547694725730;
-
-    function lookupFleetSizeCoeff(version) {
-      for (const [ver, min, max, coeff] of dataFleetSizecoeff) {
-        if (Number(ver) === version && inputFleetSize >= Number(min) && inputFleetSize < Number(max)) {
-          return Number(coeff);
-        }
-      }
-      return 1;
-    }
-
-    function lookupEstValueCoeff(version, acv) {
-      for (const [ver, min, max, coeff] of dataEstValuecoeff) {
-        if (Number(ver) === version && acv >= Number(min) && acv < Number(max)) {
-          return Number(coeff);
-        }
-      }
-      return 1;
-    }
-
-    // Pre-compute fleet size coefficients for both versions
-    const coeffFleetSizeV1 = lookupFleetSizeCoeff(1);
-    const coeffFleetSizeV2 = lookupFleetSizeCoeff(2);
+    // ===== New Fleet Size Coefficient Lookup (version-filtered) =====
+    // Table columns: A=Version, B=Min Inclusive, C=Max Exclusive, D=Coefficient
+    let newFleetCoeff = 1;
+    for (const row of dataFleetSizecoeff) {
+      const version = Number(row[0]);
+      const min     = Number(row[1]);
+      const max     = Number(row[2]);
+      const coeff   = Number(row[3]);
   
-    // ===== Risk Group Lookup Map =====
+      if (version === ratingVersion && inputFleetSize >= min && inputFleetSize < max) {
+        newFleetCoeff = coeff;
+        break;
+      }
+    }
+    Logger.log(`Input Fleet Size: ${inputFleetSize} | Version: ${ratingVersion} | New Fleet Coeff: ${newFleetCoeff}`);
+  
+    // ===== Risk Group Lookup Map (keyed on deductible only) =====
+    // Table columns: A=Deductible, B=Risk Group, C=Min Inclusive, D=Max Exclusive, E=Amount, F=Off Rent Exclusion
     const riskLookup = {};
     for (const row of dataRiskGroup) {
       const deductible = String(row[0]);
@@ -87,10 +81,8 @@ function premium_fleetsize(inputFleetSize, bustCache = false) {
       riskLookup[deductible].push({
         min:        Number(row[2]),
         max:        Number(row[3]),
-        premium:    Number(row[4]),           // col E — standard
-        premiumORE: isNaN(Number(row[5]))     // col F — ORE, fallback to standard
-          ? Number(row[4])
-          : Number(row[5])
+        premium:    Number(row[4]),
+        premiumORE: isNaN(Number(row[5])) ? Number(row[4]) : Number(row[5])
       });
     }
   
@@ -99,19 +91,22 @@ function premium_fleetsize(inputFleetSize, bustCache = false) {
   
     for (let i = 0; i < maxRows; i++) {
       const vin = vinData[i][0];
-      if (!vin) continue;  // skip empty rows
+      if (!vin) continue;
   
-      const y = Number(data2[i]?.[0] || 0);
-      const a = Number(data2[i]?.[1] || 0);
-      const t = Number(data3[i]?.[0] || 0);
-      const d = String(data4[i]?.[0] || "");
+      const existingFleetCoeff = Number(dataL[i]?.[0] || 1);
+      const finalRiskOriginal  = Number(dataO[i]?.[0] || 0);
+  
+      // Strip out existing fleet size coeff and substitute the new one
+      const coeff_finalrisk = existingFleetCoeff !== 0
+        ? (finalRiskOriginal / existingFleetCoeff) * newFleetCoeff
+        : 0;
+  
+      const d          = String(dataP[i]?.[0] || ""); // Deductible from col P
       const isApproved = String(dataApproval[i]?.[0] || "") === "Approved";
   
-      const version = (t === VERSION_1_T) ? 1 : 2;
-      const coeffFleetSize = (version === 1) ? coeffFleetSizeV1 : coeffFleetSizeV2;
-      const coeffEstValue  = lookupEstValueCoeff(version, a);
-      const coeff_finalrisk = y * coeffEstValue * t * coeffFleetSize;
-      const useORE = oreApplied && isApproved;
+      // FL: ORE applies to all vehicles when ORE is active
+      // Non-FL: ORE only applies to approved vehicles
+      const useORE = oreApplied && (state === "FL" || isApproved);
   
       const ranges = riskLookup[d] || [];
       let matched = false;
@@ -122,8 +117,9 @@ function premium_fleetsize(inputFleetSize, bustCache = false) {
           premiumValues.push(premium);
           matched = true;
           Logger.log(
-            `VIN: ${vin} | Year: ${y} | ACV: ${a} | Terr: ${t} | ` +
-            `FleetCoeff: ${coeffFleetSize} | FinalRisk: ${coeff_finalrisk} | ` +
+            `VIN: ${vin} | OriginalFinalRisk: ${finalRiskOriginal} | ` +
+            `OldFleetCoeff: ${existingFleetCoeff} | NewFleetCoeff: ${newFleetCoeff} | ` +
+            `AdjustedFinalRisk: ${coeff_finalrisk} | ` +
             `Deductible: ${d} | ORE: ${useORE} | Premium: ${premium}`
           );
           break;
@@ -132,9 +128,8 @@ function premium_fleetsize(inputFleetSize, bustCache = false) {
   
       if (!matched) {
         Logger.log(
-          `WARNING — No range matched: VIN: ${vin} | Deductible: ${d} | FinalRisk: ${coeff_finalrisk}`
+          `WARNING — No range matched: VIN: ${vin} | Deductible: ${d} | AdjustedFinalRisk: ${coeff_finalrisk}`
         );
-        // Decide whether to push 0 or skip; currently skipping to avoid skewing average
       }
     }
   
@@ -144,15 +139,13 @@ function premium_fleetsize(inputFleetSize, bustCache = false) {
       return 0;
     }
   
-    const sum = premiumValues.reduce((acc, val) => acc + val, 0);
+    const sum            = premiumValues.reduce((acc, val) => acc + val, 0);
     const averagePremium = sum / premiumValues.length;
-  
-    Logger.log(`Average Premium: ${averagePremium} | Divided by 100: ${averagePremium / 100}`);
+    Logger.log(`Average Premium: ${averagePremium}`);
     return averagePremium;
   }
   
   function testPremiumFleetSize() {
-    // Pass true as second arg to bust the cache during testing
-    const result = premium_fleetsize(15, true);
+    const result = premium_fleetsize(5, true);
     Logger.log("Returned Average Premium: " + result);
   }
