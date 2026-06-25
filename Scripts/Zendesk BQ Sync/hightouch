@@ -1,0 +1,148 @@
+WITH
+  accounts_with_coverage AS (
+    SELECT
+      customer_id AS account_entity_id,
+      MAX(end_date_coverage_exclusive) AS last_coverage_end
+    FROM
+      `production-storage-b567.policy_public.vehicle_coverage`
+    WHERE
+      COALESCE(is_archived, FALSE) = FALSE
+      AND _fivetran_deleted = FALSE
+      AND effective_date_inclusive IS NOT NULL
+      AND end_date_coverage_exclusive IS NOT NULL
+    GROUP BY
+      customer_id
+  ),
+  cleaned AS (
+    SELECT
+      DISTINCT INITCAP(a.contactname) AS contactname,
+      INITCAP(a.contactFirstName) AS contactFirstName,
+      INITCAP(a.contactLastName) AS contactLastName,
+      INITCAP(a.businessAddressLineOne) AS businessAddressLineOne,
+      INITCAP(a.businessAddressLineTwo) AS businessAddressLineTwo,
+      INITCAP(a.businessCity) AS businessCity,
+      UPPER(REGEXP_REPLACE(a.state, r'[^a-zA-Z]', '')) AS state,
+      REGEXP_EXTRACT(a.businessZipcode, r'^\d{5}') AS businessZipcode,
+      REPLACE(
+        REPLACE(
+          REPLACE(
+            REPLACE(
+              REPLACE(INITCAP(a.businesslegalname), ' Llc', ' LLC'),
+              ' Llp',
+              ' LLP'
+            ),
+            ' Dba',
+            ' DBA'
+          ),
+          ' Usa',
+          ' USA'
+        ),
+        '(Llc)',
+        '(LLC)'
+      ) AS businesslegalname,
+      REGEXP_REPLACE(a.contactemail, r'\+[^@]*', '') AS contactemail,
+      CASE
+        WHEN REGEXP_CONTAINS(
+          REGEXP_REPLACE(a.contactnumber, r'[^\d]', ''),
+          r'^\d{10}$'
+        ) THEN CONCAT('+1', REGEXP_REPLACE(a.contactnumber, r'[^\d]', ''))
+        WHEN REGEXP_CONTAINS(
+          REGEXP_REPLACE(a.contactnumber, r'[^\d]', ''),
+          r'^1\d{10}$'
+        ) THEN CONCAT('+', REGEXP_REPLACE(a.contactnumber, r'[^\d]', ''))
+        ELSE a.contactnumber
+      END AS contactnumber,
+      REGEXP_REPLACE(a.businessemail, r'\+[^@]*', '') AS businessemail,
+      CASE
+        WHEN REGEXP_CONTAINS(
+          REGEXP_REPLACE(a.businessphone, r'[^\d]', ''),
+          r'^\d{10}$'
+        ) THEN CONCAT('+1', REGEXP_REPLACE(a.businessphone, r'[^\d]', ''))
+        WHEN REGEXP_CONTAINS(
+          REGEXP_REPLACE(a.businessphone, r'[^\d]', ''),
+          r'^1\d{10}$'
+        ) THEN CONCAT('+', REGEXP_REPLACE(a.businessphone, r'[^\d]', ''))
+        ELSE a.businessphone
+      END AS businessphone,
+      a.account_id,
+      a.status,
+      -- Most recent date this account last had a valid vehicle_coverage period
+      -- (NULL if it never had one). Used as a secondary tiebreaker so the winning
+      -- account_id per business is stable: status today first, then the account
+      -- that most recently had coverage, then a deterministic account_id tiebreaker.
+      awc.last_coverage_end
+    FROM
+      `production-storage-b567.scheduled_queries.accounts_latest` a
+      LEFT JOIN accounts_with_coverage awc ON a.account_id = awc.account_entity_id
+    WHERE
+      a.demo IS FALSE
+  ),
+  valid_emails AS (
+    SELECT
+      *
+    FROM
+      cleaned
+    WHERE
+      REGEXP_CONTAINS(contactemail, r'^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$')
+  ),
+  ranked_by_name AS (
+    SELECT
+      *,
+      ROW_NUMBER() OVER (
+        PARTITION BY businesslegalname
+        ORDER BY
+          CASE
+            WHEN status = 'Active' THEN 0
+            WHEN status = 'Pending Activation' THEN 1
+            WHEN status = 'Onboarding' THEN 2
+            ELSE 3
+          END,
+          last_coverage_end DESC NULLS LAST,
+          account_id
+      ) AS rn
+    FROM
+      valid_emails
+  ),
+  ranked_by_email AS (
+    SELECT
+      *,
+      ROW_NUMBER() OVER (
+        PARTITION BY contactemail
+        ORDER BY
+          CASE
+            WHEN status = 'Active' THEN 0
+            WHEN status = 'Pending Activation' THEN 1
+            WHEN status = 'Onboarding' THEN 2
+            ELSE 3
+          END,
+          last_coverage_end DESC NULLS LAST,
+          account_id
+      ) AS rn_email
+    FROM
+      ranked_by_name
+    WHERE
+      rn = 1
+  )
+SELECT
+  contactname,
+  contactFirstName,
+  contactLastName,
+  businesslegalname,
+  contactemail,
+  contactnumber,
+  businessemail,
+  businessphone,
+  businessAddressLineOne,
+  businessAddressLineTwo,
+  businessCity,
+  state,
+  businessZipcode,
+  account_id,
+  -- Zendesk dropdown fields match on the snake_case TAG, not the display label,
+  -- so emit e.g. 'Pending Activation' -> 'pending_activation'. Transform only
+  -- here in the final SELECT; the dedup ranking above relies on the raw labels.
+  LOWER(REGEXP_REPLACE(TRIM(status), r'\s+', '_')) AS status
+FROM
+  ranked_by_email
+WHERE
+  rn_email = 1
