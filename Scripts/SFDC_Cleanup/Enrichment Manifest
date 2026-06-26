@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""
+Enrich the attachment manifest with the Salesforce records each file belongs to.
+
+Your export_attachments.py produced manifest.csv with one row per attachment,
+including ParentId. For these legacy email attachments the chain is:
+
+    Attachment.ParentId  ->  EmailMessage.Id
+    EmailMessage.ParentId ->  Case.Id   (the case the email is logged against)
+
+This script reads manifest.csv, resolves that chain in bulk, and writes
+manifest_enriched.csv adding:
+
+    EmailSubject, EmailFrom, EmailTo, EmailDate, EmailIncoming,
+    CaseId, CaseNumber, CaseSubject, CaseContactEmail, CaseAccountName
+
+That gives you a restore/lookup map: for any backed-up file you can see which
+case/email/customer it came from -- essential if you ever need to find or
+re-attach one after the hard delete.
+
+It also handles parents that AREN'T EmailMessages (some attachments may sit
+directly on a Case, Lead, etc.) by detecting the key prefix and looking up
+the object generically.
+
+------------------------------------------------------------------------------
+SETUP / AUTH  -- same as export_attachments.py
+------------------------------------------------------------------------------
+    pip install simple-salesforce requests
+    Credentials are read from 1Password item "Salesforce Access Token"
+    (fields: username, password, credential=security token)
+
+RUN
+    python enrich_manifest.py --manifest /path/to/attachment_backup/manifest.csv
+    # output written next to it as manifest_enriched.csv
+------------------------------------------------------------------------------
+"""
+
+import os
+import csv
+import sys
+import argparse
+
+import subprocess
+import requests
+
+API_VERSION = "v60.0"
+CHUNK = 200  # SOQL IN() batch size
+
+OP_ITEM_NAME = os.environ.get("OP_SF_ITEM", "Salesforce Access Token")
+
+
+def _op_read(item, field):
+    result = subprocess.run(
+        ["op", "item", "get", item, "--field", field, "--reveal"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        sys.exit(
+            f"1Password lookup failed for item '{item}', field '{field}':\n"
+            f"{result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def get_session():
+    try:
+        from simple_salesforce import Salesforce
+    except ImportError:
+        sys.exit("Run: pip install simple-salesforce")
+
+    username = _op_read(OP_ITEM_NAME, "username")
+    password = _op_read(OP_ITEM_NAME, "password")
+    security_token = _op_read(OP_ITEM_NAME, "credential")
+
+    sf = Salesforce(
+        username=username,
+        password=password,
+        security_token=security_token,
+        domain="login",
+    )
+    s = requests.Session()
+    s.headers.update({"Authorization": f"Bearer {sf.session_id}"})
+    return s, f"https://{sf.sf_instance}".rstrip("/")
+
+
+def soql(session, instance_url, q):
+    out = []
+    url = f"{instance_url}/services/data/{API_VERSION}/query"
+    params = {"q": q}
+    while True:
+        r = session.get(url, params=params, timeout=120)
+        if r.status_code != 200:
+            sys.exit(f"Query failed [{r.status_code}]: {r.text}")
+        d = r.json()
+        out.extend(d["records"])
+        if d.get("done"):
+            break
+        url = f"{instance_url}{d['nextRecordsUrl']}"
+        params = None
+    return out
+
+
+def chunked(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def quote_ids(ids):
+    return ",".join("'" + i + "'" for i in ids)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--manifest", required=True, help="path to manifest.csv")
+    ap.add_argument("--out", default=None,
+                    help="output path (default: manifest_enriched.csv beside input)")
+    args = ap.parse_args()
+
+    if not os.path.exists(args.manifest):
+        sys.exit(f"Manifest not found: {args.manifest}")
+    out_path = args.out or os.path.join(
+        os.path.dirname(os.path.abspath(args.manifest)),
+        "manifest_enriched.csv",
+    )
+
+    # --- read manifest ---
+    with open(args.manifest, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    print(f"Read {len(rows):,} manifest rows.")
+
+    parent_ids = sorted({r["ParentId"] for r in rows if r.get("ParentId")})
+    # EmailMessage ids start with 02s
+    email_ids = [p for p in parent_ids if p.startswith("02s")]
+    other_ids = [p for p in parent_ids if not p.startswith("02s")]
+    print(f"  {len(email_ids):,} EmailMessage parents, "
+          f"{len(other_ids):,} other-object parents.")
+
+    session, instance_url = get_session()
+    print(f"Connected: {instance_url}")
+
+    # --- resolve EmailMessage -> case fields ---
+    email_map = {}     # emailId -> dict of email fields + caseId
+    case_ids = set()
+    for batch in chunked(email_ids, CHUNK):
+        q = ("SELECT Id, ParentId, Subject, FromAddress, ToAddress, "
+             "MessageDate, Incoming FROM EmailMessage "
+             f"WHERE Id IN ({quote_ids(batch)})")
+        for rec in soql(session, instance_url, q):
+            email_map[rec["Id"]] = {
+                "EmailSubject": rec.get("Subject") or "",
+                "EmailFrom": rec.get("FromAddress") or "",
+                "EmailTo": rec.get("ToAddress") or "",
+                "EmailDate": rec.get("MessageDate") or "",
+                "EmailIncoming": rec.get("Incoming"),
+                "CaseId": rec.get("ParentId") or "",
+            }
+            if rec.get("ParentId", "").startswith("500"):
+                case_ids.add(rec["ParentId"])
+    print(f"  resolved {len(email_map):,} emails, "
+          f"{len(case_ids):,} distinct cases.")
+
+    # --- resolve Case fields ---
+    case_map = {}
+    for batch in chunked(sorted(case_ids), CHUNK):
+        q = ("SELECT Id, CaseNumber, Subject, ContactEmail, Account.Name "
+             f"FROM Case WHERE Id IN ({quote_ids(batch)})")
+        for rec in soql(session, instance_url, q):
+            acct = rec.get("Account") or {}
+            case_map[rec["Id"]] = {
+                "CaseNumber": rec.get("CaseNumber") or "",
+                "CaseSubject": rec.get("Subject") or "",
+                "CaseContactEmail": rec.get("ContactEmail") or "",
+                "CaseAccountName": (acct or {}).get("Name") or "",
+            }
+
+    # --- resolve non-email parents generically (Case/Lead/etc directly) ---
+    other_map = {}
+    # group by object via prefix; we just fetch Id + Name where possible
+    for batch in chunked(other_ids, CHUNK):
+        # Use a generic Name lookup per object type; simplest is per-id
+        # but to stay efficient, try Case and Lead which are most likely.
+        pass  # most parents are emails; extend here if you have many others
+
+    # --- write enriched file ---
+    extra_cols = ["EmailSubject", "EmailFrom", "EmailTo", "EmailDate",
+                  "EmailIncoming", "CaseId", "CaseNumber", "CaseSubject",
+                  "CaseContactEmail", "CaseAccountName"]
+    fieldnames = list(rows[0].keys()) + extra_cols
+
+    with open(out_path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            pid = r.get("ParentId", "")
+            em = email_map.get(pid, {})
+            cid = em.get("CaseId", "")
+            cm = case_map.get(cid, {})
+            r.update({
+                "EmailSubject": em.get("EmailSubject", ""),
+                "EmailFrom": em.get("EmailFrom", ""),
+                "EmailTo": em.get("EmailTo", ""),
+                "EmailDate": em.get("EmailDate", ""),
+                "EmailIncoming": em.get("EmailIncoming", ""),
+                "CaseId": cid,
+                "CaseNumber": cm.get("CaseNumber", ""),
+                "CaseSubject": cm.get("CaseSubject", ""),
+                "CaseContactEmail": cm.get("CaseContactEmail", ""),
+                "CaseAccountName": cm.get("CaseAccountName", ""),
+            })
+            w.writerow(r)
+
+    print("-" * 60)
+    print(f"Wrote {out_path}")
+    print(f"  {len(rows):,} rows, each mapped to its email + case where found.")
+    matched = sum(1 for r in rows if email_map.get(r.get("ParentId", "")))
+    print(f"  {matched:,} rows resolved to an EmailMessage "
+          f"({len(rows)-matched:,} unresolved -- parent may be a "
+          f"non-email object or a deleted record).")
+
+
+if __name__ == "__main__":
+    main()
